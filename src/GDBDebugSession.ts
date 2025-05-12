@@ -47,7 +47,7 @@ export interface RequestArguments extends DebugProtocol.LaunchRequestArguments {
     verbose?: boolean;
     logFile?: string;
     openGdbConsole?: boolean;
-    initCommands?: string[];
+    initCommands?: Array<string | { text: string; ignoreFailures: boolean }>;
     hardwareBreakpoint?: boolean;
 }
 
@@ -434,7 +434,7 @@ export class GDBDebugSession extends LoggingDebugSession {
             } else if (!(await this.gdb.supportsNewUi(args.gdb))) {
                 logger.warn(
                     `cdt-gdb-adapter: new-ui command not detected (${
-                        args.gdb || 'gdb'
+                        args.gdb || 'cuda-gdb'
                     })`
                 );
             } else {
@@ -1283,15 +1283,12 @@ export class GDBDebugSession extends LoggingDebugSession {
                             varobj.value = update.value;
                         }
                     } else {
-                        this.gdb.varManager.removeVar(
+                        await this.gdb.varManager.removeVar(
                             frame.frameId,
                             frame.threadId,
                             depth,
                             varobj.varname
                         );
-                        await mi.sendVarDelete(this.gdb, {
-                            varname: varobj.varname,
-                        });
                         const varCreateResponse = await mi.sendVarCreate(
                             this.gdb,
                             {
@@ -1474,10 +1471,10 @@ export class GDBDebugSession extends LoggingDebugSession {
 
             const toString = (i: DebugProtocol.DisassembledInstruction) =>
                 i.address +
-                    ': ' +
-                    format(i.instruction, 40) +
-                    '; ' +
-                    i.symbol ?? 'Unknown function';
+                ': ' +
+                format(i.instruction, 40) +
+                '; ' +
+                (i.symbol ?? 'Unknown function');
 
             const announceWidth = instructionsSkipped ? 25 : 17;
 
@@ -1715,6 +1712,8 @@ export class GDBDebugSession extends LoggingDebugSession {
         // Reset frame handles and variables for new context
         this.frameHandles.reset();
         this.variableHandles.reset();
+        this.gdb.varManager.reset();
+
         // Send the event
         this.sendEvent(new StoppedEvent(reason, threadId, allThreadsStopped));
     }
@@ -1916,6 +1915,9 @@ export class GDBDebugSession extends LoggingDebugSession {
         // array of varnames to delete. Cannot delete while iterating through the vars array below.
         const toDelete = new Array<string>();
 
+        // set of varnames that have already been added to variables
+        const pushedVars = new Set<string>();
+
         // get the list of vars we need to update for this frameId/threadId/depth tuple
         const vars = this.gdb.varManager.getVars(
             frame.frameId,
@@ -1951,7 +1953,8 @@ export class GDBDebugSession extends LoggingDebugSession {
                         numVars++;
                     }
                     // only push entries to the result that aren't being deleted
-                    if (pushVar) {
+                    if (pushVar && !pushedVars.has(varobj.varname)) {
+                        pushedVars.add(varobj.varname);
                         let value = varobj.value;
                         // if we have an array parent entry, we need to display the address.
                         if (arrayRegex.test(varobj.type)) {
@@ -2015,6 +2018,9 @@ export class GDBDebugSession extends LoggingDebugSession {
                         varCreateResponse
                     );
                 } else {
+                    if (pushedVars.has(varobj.varname)) {
+                        continue;
+                    }
                     // var existed as an expression before. Now it's a variable too.
                     varobj = await this.gdb.varManager.updateVar(
                         frame.frameId,

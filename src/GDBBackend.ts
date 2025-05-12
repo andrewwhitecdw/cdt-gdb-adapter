@@ -193,10 +193,46 @@ export class GDBBackend extends events.EventEmitter {
         return compareVersions(this.gdbVersion, targetVersion) >= 0;
     }
 
-    public async sendCommands(commands?: string[]) {
+    /**
+     * Sends multiple commands sequentially.
+     * Each command can be a string or an object { text: string, ignoreFailures: boolean }.
+     * If a command is a string, it's treated as { text: command, ignoreFailures: false }.
+     * If ignoreFailures is true for a command, errors during its execution are logged but do not stop subsequent commands.
+     * If ignoreFailures is false (or implied for a string command), errors will stop execution and be re-thrown.
+     */
+    public async sendCommands(
+        commands?: Array<string | { text: string; ignoreFailures: boolean }>
+    ): Promise<void> {
         if (commands) {
-            for (const command of commands) {
-                await this.sendCommand(command);
+            for (const commandItem of commands) {
+                let commandText: string;
+                let ignoreFailures: boolean;
+
+                if (typeof commandItem === 'string') {
+                    commandText = commandItem;
+                    ignoreFailures = false;
+                } else {
+                    commandText = commandItem.text;
+                    ignoreFailures = commandItem.ignoreFailures;
+                }
+
+                try {
+                    await this.sendCommand(commandText);
+                } catch (error) {
+                    if (ignoreFailures) {
+                        // Log the error but continue the loop
+                        const errorMessage =
+                            error instanceof Error
+                                ? error.message
+                                : String(error);
+                        logger.warn(
+                            `Setup command "${commandText}" failed but failures are ignored: ${errorMessage}`
+                        );
+                    } else {
+                        // Re-throw the error to stop execution for commands where failures are NOT ignored
+                        throw error;
+                    }
+                }
             }
         }
     }

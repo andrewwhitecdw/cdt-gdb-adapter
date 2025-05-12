@@ -106,6 +106,24 @@ export class VarManager {
         return varobj;
     }
 
+    public reset() {
+        // Clear the map itself synchronously first so that new "variable" and "evaluate" requests
+        // henceforth don't reuse the same gdb variable objects. Actual deletion of gdb vars has
+        // to be async, but the caller doesn't need to care about that.
+
+        const varMap = [...this.variableMap.values()];
+        this.variableMap.clear();
+
+        for (const vars of varMap) {
+            for (const varobj of vars) {
+                // Fire-and-forget async cleanup; if it fails, we don't care.
+                sendVarDelete(this.gdb, { varname: varobj.varname }).catch(
+                    () => {}
+                );
+            }
+        }
+    }
+
     public async removeVar(
         frameId: number,
         threadId: number,
@@ -154,8 +172,7 @@ export class VarManager {
                     varobj.value = update.value;
                 }
             } else {
-                this.removeVar(frameId, threadId, depth, varobj.varname);
-                await sendVarDelete(this.gdb, { varname: varobj.varname });
+                await this.removeVar(frameId, threadId, depth, varobj.varname);
                 const createResponse = await sendVarCreate(this.gdb, {
                     frame: 'current',
                     expression: varobj.expression,

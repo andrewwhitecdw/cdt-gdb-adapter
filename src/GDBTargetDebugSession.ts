@@ -175,7 +175,7 @@ export class GDBTargetDebugSession extends GDBDebugSession {
         }
         const target = args.target;
         const serverExe =
-            target.server !== undefined ? target.server : 'gdbserver';
+            target.server !== undefined ? target.server : 'cuda-gdbserver';
         const serverCwd = target.cwd !== undefined ? target.cwd : args.cwd;
         const serverParams =
             target.serverParameters !== undefined

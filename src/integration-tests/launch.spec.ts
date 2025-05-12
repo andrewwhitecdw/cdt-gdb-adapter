@@ -59,7 +59,8 @@ describe('launch', function () {
                 msg.includes('/does/not/exist') &&
                 (msg.includes('The system cannot find the path specified') ||
                     msg.includes('No such file or directory') ||
-                    msg.includes('not found'))
+                    msg.includes('not found') ||
+                    msg.includes('Unknown command'))
         );
     });
 

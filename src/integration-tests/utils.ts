@@ -289,7 +289,7 @@ export function logFileName(test: Runnable): string {
 function getGdbPathCli(): string | undefined {
     const keyIndex = process.argv.indexOf('--gdb-path');
     if (keyIndex === -1) {
-        return undefined;
+        return 'cuda-gdb';
     }
     return process.argv[keyIndex + 1];
 }
@@ -297,7 +297,7 @@ function getGdbPathCli(): string | undefined {
 function getGdbServerPathCli(): string {
     const keyIndex = process.argv.indexOf('--gdbserver-path');
     if (keyIndex === -1) {
-        return 'gdbserver';
+        return 'cuda-gdbserver';
     }
     return process.argv[keyIndex + 1];
 }
@@ -321,8 +321,10 @@ export async function gdbVersionAtLeast(
     targetVersion: string
 ): Promise<boolean> {
     return (
-        compareVersions(await getGdbVersion(gdbPath || 'gdb'), targetVersion) >=
-        0
+        compareVersions(
+            await getGdbVersion(gdbPath || 'cuda-gdb'),
+            targetVersion
+        ) >= 0
     );
 }
 
