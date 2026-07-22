@@ -73,9 +73,15 @@ export function sendDataWriteMemoryBytes(
 
 export function sendDataEvaluateExpression(
     gdb: GDBBackend,
-    expr: string
+    expr: string,
+    frameId: number,
+    threadId: number
 ): Promise<MIGDBDataEvaluateExpressionResponse> {
-    return gdb.sendCommand(`-data-evaluate-expression "${expr}"`);
+    return gdb.sendCommand(
+        `-data-evaluate-expression --frame ${frameId} --thread ${threadId} ${gdb.standardEscape(
+            expr
+        )}`
+    );
 }
 
 // https://sourceware.org/gdb/onlinedocs/gdb/GDB_002fMI-Data-Manipulation.html#The-_002ddata_002ddisassemble-Command

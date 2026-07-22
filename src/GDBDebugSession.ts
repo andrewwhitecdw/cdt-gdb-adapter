@@ -36,6 +36,7 @@ import {
 import { StoppedEvent } from './stoppedEvent';
 import { VarObjType } from './varManager';
 import { breakpointFunctionLocation, breakpointLocation } from './mi';
+import { resolveLogPointMessage } from './logpoint';
 
 export interface RequestArguments extends DebugProtocol.LaunchRequestArguments {
     gdb?: string;
@@ -193,6 +194,47 @@ export class GDBDebugSession extends LoggingDebugSession {
     // set to true if the target was interrupted where inteneded, and should
     // therefore be resumed after breakpoints are inserted.
     protected waitPausedNeeded = false;
+    // True when the caller setting waitPaused wants the resulting StoppedEvent
+    // forwarded to the client (attach-entry UX); false when it's an internal
+    // bookkeeping pause that should be hidden from the user. Callers must set
+    // this explicitly when assigning waitPaused. Reset to false when the
+    // resolver fires.
+    protected waitPausedSurfacesToUser = false;
+    // When non-undefined, the next StoppedEvent emitted by handleGDBStopped's
+    // signal-received case uses this reason string instead of the signal name.
+    // Used by callers that pause via -exec-interrupt but want a specific
+    // user-facing reason (e.g. 'entry' for attach UX). Cleared after one use.
+    protected stoppedEventReasonOverride: string | undefined;
+
+    // Serializes handlers that temporarily pause through waitPaused. The
+    // waitPaused field above is a single resolver shared by breakpoint handlers
+    // and attach configurationDone; without serialization, concurrent handlers
+    // overwrite each other's resolver and all but the last to arrive hang.
+    private waitPausedMutex: Promise<void> = Promise.resolve();
+
+    /**
+     * Run an async function under the waitPaused mutex. Required because
+     * waitPaused is a single resolver shared by multiple DAP handlers and would
+     * otherwise be overwritten when they run concurrently.
+     *
+     * Concurrent callers are serialized in FIFO order. Errors from `fn`
+     * propagate to the caller but don't poison the chain for subsequent
+     * callers. Calling withWaitPausedMutex recursively from inside an
+     * in-flight `fn` deadlocks.
+     */
+    protected async withWaitPausedMutex<T>(fn: () => Promise<T>): Promise<T> {
+        const previous = this.waitPausedMutex;
+        let release!: () => void;
+        this.waitPausedMutex = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        try {
+            await previous;
+            return await fn();
+        } finally {
+            release();
+        }
+    }
 
     // Determines whether or not breakpoint condiitions are added with the --force argument.
     // Without --force, if the symbols used in the condition's expression cannot be resolved
@@ -478,7 +520,23 @@ export class GDBDebugSession extends LoggingDebugSession {
         );
     }
 
+    /**
+     * Handle source breakpoints (file:line breakpoints).
+     *
+     * WARNING: This function has significant code overlap with setInstructionBreakpointsRequest
+     * (in CudaGdbSession). If you're changing this function, you probably need to change
+     * setInstructionBreakpointsRequest as well to maintain consistency.
+     */
     protected async setBreakPointsRequest(
+        response: DebugProtocol.SetBreakpointsResponse,
+        args: DebugProtocol.SetBreakpointsArguments
+    ): Promise<void> {
+        return this.withWaitPausedMutex(() =>
+            this.setBreakPointsRequestLocked(response, args)
+        );
+    }
+
+    private async setBreakPointsRequestLocked(
         response: DebugProtocol.SetBreakpointsResponse,
         args: DebugProtocol.SetBreakpointsArguments
     ): Promise<void> {
@@ -488,6 +546,7 @@ export class GDBDebugSession extends LoggingDebugSession {
             const waitPromise = new Promise<void>((resolve) => {
                 this.waitPaused = resolve;
             });
+            this.waitPausedSurfacesToUser = false;
             if (this.gdb.isNonStopMode()) {
                 const threadInfo = await mi.sendThreadInfoRequest(this.gdb, {});
 
@@ -659,9 +718,9 @@ export class GDBDebugSession extends LoggingDebugSession {
 
         if (this.waitPausedNeeded) {
             if (this.gdb.isNonStopMode()) {
-                mi.sendExecContinue(this.gdb, this.waitPausedThreadId);
+                await mi.sendExecContinue(this.gdb, this.waitPausedThreadId);
             } else {
-                mi.sendExecContinue(this.gdb);
+                await mi.sendExecContinue(this.gdb);
             }
         }
     }
@@ -670,12 +729,22 @@ export class GDBDebugSession extends LoggingDebugSession {
         response: DebugProtocol.SetFunctionBreakpointsResponse,
         args: DebugProtocol.SetFunctionBreakpointsArguments
     ) {
+        return this.withWaitPausedMutex(() =>
+            this.setFunctionBreakPointsRequestLocked(response, args)
+        );
+    }
+
+    private async setFunctionBreakPointsRequestLocked(
+        response: DebugProtocol.SetFunctionBreakpointsResponse,
+        args: DebugProtocol.SetFunctionBreakpointsArguments
+    ): Promise<void> {
         this.waitPausedNeeded = this.isRunning;
         if (this.waitPausedNeeded) {
             // Need to pause first
             const waitPromise = new Promise<void>((resolve) => {
                 this.waitPaused = resolve;
             });
+            this.waitPausedSurfacesToUser = false;
             if (this.gdb.isNonStopMode()) {
                 const threadInfo = await mi.sendThreadInfoRequest(this.gdb, {});
 
@@ -779,9 +848,9 @@ export class GDBDebugSession extends LoggingDebugSession {
 
         if (this.waitPausedNeeded) {
             if (this.gdb.isNonStopMode()) {
-                mi.sendExecContinue(this.gdb, this.waitPausedThreadId);
+                await mi.sendExecContinue(this.gdb, this.waitPausedThreadId);
             } else {
-                mi.sendExecContinue(this.gdb);
+                await mi.sendExecContinue(this.gdb);
             }
         }
     }
@@ -829,16 +898,63 @@ export class GDBDebugSession extends LoggingDebugSession {
     ): Promise<void> {
         try {
             if (this.isAttach) {
-                await mi.sendExecContinue(this.gdb);
+                await this.withWaitPausedMutex(() =>
+                    this.configurationDoneAttachRequestLocked(response)
+                );
             } else {
                 await mi.sendExecRun(this.gdb);
+                this.sendResponse(response);
             }
-            this.sendResponse(response);
         } catch (err) {
             this.sendErrorResponse(
                 response,
                 100,
                 err instanceof Error ? err.message : String(err)
+            );
+        }
+    }
+
+    private async configurationDoneAttachRequestLocked(
+        response: DebugProtocol.ConfigurationDoneResponse
+    ): Promise<void> {
+        // Leave the inferior in its post-attach paused state; matches gdb and cuda-gdb attach behavior.
+        if (this.isRunning) {
+            // Pause the inferior. Set surfacesToUser=true so the suppression in
+            // case 'stopped' lets the resulting StoppedEvent through to the client,
+            // and stoppedEventReasonOverride='entry' so handleGDBStopped's
+            // signal-received case emits reason='entry' instead of the signal name.
+            const waitPromise = new Promise<void>((resolve) => {
+                this.waitPaused = resolve;
+            });
+            this.waitPausedSurfacesToUser = true;
+            this.stoppedEventReasonOverride = 'entry';
+            if (this.gdb.isNonStopMode()) {
+                const threadInfo = await mi.sendThreadInfoRequest(this.gdb, {});
+                this.waitPausedThreadId = parseInt(
+                    threadInfo['current-thread-id'],
+                    10
+                );
+                this.gdb.pause(this.waitPausedThreadId);
+            } else {
+                this.gdb.pause();
+            }
+            await waitPromise;
+            this.sendResponse(response);
+        } else {
+            // Inferior was already paused (e.g., no breakpoints to insert,
+            // or natural attach left it paused). No *stopped event will fire
+            // to trigger the natural flow, so manually emit the entry event
+            // so VSCode shows the paused-debug UI.
+            this.sendResponse(response);
+            const threadInfo = await mi.sendThreadInfoRequest(this.gdb, {});
+            const currentThreadId = parseInt(
+                threadInfo['current-thread-id'],
+                10
+            );
+            this.sendStoppedEvent(
+                'entry',
+                currentThreadId,
+                !this.gdb.isNonStopMode()
             );
         }
     }
@@ -1423,8 +1539,6 @@ export class GDBDebugSession extends LoggingDebugSession {
                     funcAndOffset = `${asmLine['func-name']}+${asmLine.offset}`;
                 } else if (asmLine['func-name']) {
                     funcAndOffset = asmLine['func-name'];
-                } else {
-                    funcAndOffset = undefined;
                 }
                 const disInsn = {
                     address: asmLine.address,
@@ -1718,6 +1832,32 @@ export class GDBDebugSession extends LoggingDebugSession {
         this.sendEvent(new StoppedEvent(reason, threadId, allThreadsStopped));
     }
 
+    /**
+     * Evaluate VS Code log point message placeholders and emit the result.
+     * Placeholders use `{expression}` syntax; each expression is evaluated in the
+     * stopped thread's current frame. Typos and other GDB evaluation failures are
+     * substituted as `<error: ...>` so the remaining log line still prints.
+     */
+    protected async handleLogPoint(
+        message: string,
+        threadId: number
+    ): Promise<void> {
+        const resolvedMessage = await resolveLogPointMessage(
+            message,
+            async (expression) => {
+                const result = await mi.sendDataEvaluateExpression(
+                    this.gdb,
+                    expression,
+                    0,
+                    threadId
+                );
+                return result.value ?? '';
+            }
+        );
+        this.sendEvent(new OutputEvent(resolvedMessage));
+        mi.sendExecContinue(this.gdb);
+    }
+
     protected handleGDBStopped(result: any) {
         const getThreadId = (resultData: any) =>
             parseInt(resultData['thread-id'], 10);
@@ -1735,10 +1875,10 @@ export class GDBDebugSession extends LoggingDebugSession {
                 break;
             case 'breakpoint-hit':
                 if (this.logPointMessages[result.bkptno]) {
-                    this.sendEvent(
-                        new OutputEvent(this.logPointMessages[result.bkptno])
+                    void this.handleLogPoint(
+                        this.logPointMessages[result.bkptno],
+                        getThreadId(result)
                     );
-                    mi.sendExecContinue(this.gdb);
                 } else {
                     const reason =
                         this.functionBreakpoints.indexOf(result.bkptno) > -1
@@ -1760,7 +1900,9 @@ export class GDBDebugSession extends LoggingDebugSession {
                 );
                 break;
             case 'signal-received': {
-                const name = result['signal-name'] || 'signal';
+                const overridden = this.stoppedEventReasonOverride;
+                this.stoppedEventReasonOverride = undefined;
+                const name = overridden ?? result['signal-name'] ?? 'signal';
                 this.sendStoppedEvent(
                     name,
                     getThreadId(result),
@@ -1814,7 +1956,8 @@ export class GDBDebugSession extends LoggingDebugSession {
                     if (
                         this.waitPaused &&
                         resultData.reason === 'signal-received' &&
-                        this.waitPausedThreadId === id
+                        this.waitPausedThreadId === id &&
+                        !this.waitPausedSurfacesToUser
                     ) {
                         suppressHandleGDBStopped = true;
                     }
@@ -1824,7 +1967,8 @@ export class GDBDebugSession extends LoggingDebugSession {
                     }
                     if (
                         this.waitPaused &&
-                        resultData.reason === 'signal-received'
+                        resultData.reason === 'signal-received' &&
+                        !this.waitPausedSurfacesToUser
                     ) {
                         suppressHandleGDBStopped = true;
                     }
@@ -1839,6 +1983,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                     }
                     this.waitPaused();
                     this.waitPaused = undefined;
+                    this.waitPausedSurfacesToUser = false;
                 }
 
                 const wasRunning = this.isRunning;
@@ -1852,6 +1997,10 @@ export class GDBDebugSession extends LoggingDebugSession {
                         this.handleGDBStopped(resultData);
                     }
                 }
+                // Clear the override so it doesn't leak past stops that
+                // weren't signal-received (handleGDBStopped's case for that
+                // already consumes it).
+                this.stoppedEventReasonOverride = undefined;
                 break;
             }
             default:
@@ -1958,7 +2107,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                         let value = varobj.value;
                         // if we have an array parent entry, we need to display the address.
                         if (arrayRegex.test(varobj.type)) {
-                            value = await this.getAddr(varobj);
+                            value = await this.getAddr(varobj, frame);
                         }
                         variables.push({
                             name: varobj.expression,
@@ -2033,7 +2182,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                 let value = varobj.value;
                 // if we have an array parent entry, we need to display the address.
                 if (arrayRegex.test(varobj.type)) {
-                    value = await this.getAddr(varobj);
+                    value = await this.getAddr(varobj, frame);
                 }
                 variables.push({
                     name: varobj.expression,
@@ -2177,7 +2326,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                     }
                     // if we have an array parent entry, we need to display the address.
                     if (isArrayParent) {
-                        value = await this.getAddr(arrobj);
+                        value = await this.getAddr(arrobj, frame);
                     }
                     arrobj.isChild = true;
                     varobjName = arrobj.varname;
@@ -2257,10 +2406,12 @@ export class GDBDebugSession extends LoggingDebugSession {
         return Promise.resolve(variables);
     }
 
-    protected async getAddr(varobj: VarObjType) {
+    protected async getAddr(varobj: VarObjType, frame: FrameReference) {
         const addr = await mi.sendDataEvaluateExpression(
             this.gdb,
-            `&(${varobj.expression})`
+            `&(${varobj.expression})`,
+            frame.frameId,
+            frame.threadId
         );
         return addr.value ? addr.value : varobj.value;
     }
