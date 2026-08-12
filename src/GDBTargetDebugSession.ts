@@ -144,7 +144,7 @@ export class GDBTargetDebugSession extends GDBDebugSession {
         }
     }
 
-    protected setupCommonLoggerAndHandlers(args: TargetLaunchRequestArguments) {
+    protected setupCommonLoggerAndHandlers(args: TargetAttachRequestArguments) {
         logger.setup(
             args.verbose ? Logger.LogLevel.Verbose : Logger.LogLevel.Warn,
             args.logFile || false
