@@ -71,9 +71,6 @@ export interface TargetAttachRequestArguments extends RequestArguments {
 export interface TargetLaunchRequestArguments
     extends TargetAttachRequestArguments {
     target?: TargetLaunchArguments;
-    imageAndSymbols?: ImageAndSymbolArguments;
-    // Optional commands to issue between loading image and resuming target
-    preRunCommands?: string[];
 }
 
 export class GDBTargetDebugSession extends GDBDebugSession {
