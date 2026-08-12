@@ -182,6 +182,10 @@ export class GDBTargetDebugSession extends GDBDebugSession {
         // Wait until gdbserver is started and ready to receive connections.
         await new Promise<void>((resolve, reject) => {
             this.gdbserver = spawn(serverExe, serverParams, { cwd: serverCwd });
+            const startupDelay =
+                target.serverStartupDelay !== undefined
+                    ? target.serverStartupDelay
+                    : 0;
             let gdbserverStartupResolved = false;
             let accumulatedStderr = '';
             let checkTargetPort = (_data: any) => {
@@ -193,9 +197,7 @@ export class GDBTargetDebugSession extends GDBDebugSession {
                         gdbserverStartupResolved = true;
                         resolve();
                     },
-                    target.serverStartupDelay !== undefined
-                        ? target.serverStartupDelay
-                        : 0
+                    startupDelay
                 );
             } else {
                 checkTargetPort = (data: any) => {
@@ -212,9 +214,7 @@ export class GDBTargetDebugSession extends GDBDebugSession {
                                 gdbserverStartupResolved = true;
                                 resolve();
                             },
-                            target.serverStartupDelay !== undefined
-                                ? target.serverStartupDelay
-                                : 0
+                            startupDelay
                         );
                     }
                 };
